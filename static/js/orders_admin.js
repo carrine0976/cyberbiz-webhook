@@ -289,10 +289,25 @@ function getEditorHtmlWithPlaceholders() {
     });
     return temp.innerHTML;
 }
+// ---------- 刪除樣板：先跳出自訂確認 modal，按下確定後才真正呼叫刪除 API ----------
+var pendingDeletePlanCode = null;
+
 function deleteTemplate(pc) {
-    if (!confirm('確定要刪除樣板「' + pc + '」嗎？此操作無法復原。')) {
-        return;
-    }
+    pendingDeletePlanCode = pc;
+    document.getElementById('deleteConfirmPlanCode').innerText = pc;
+    document.getElementById('deleteConfirmError').innerText = '';
+    document.getElementById('deleteConfirmOverlay').classList.add('show');
+}
+
+function closeDeleteConfirm() {
+    document.getElementById('deleteConfirmOverlay').classList.remove('show');
+    pendingDeletePlanCode = null;
+}
+
+function confirmDeleteTemplate() {
+    var pc = pendingDeletePlanCode;
+    if (!pc) return;
+
     fetch('/admin/templates/api/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -308,11 +323,12 @@ function deleteTemplate(pc) {
             if (window.TEMPLATES) {
                 delete window.TEMPLATES[pc];
             }
+            closeDeleteConfirm();
         } else {
-            alert(data.message);
+            document.getElementById('deleteConfirmError').innerText = data.message || '刪除失敗';
         }
     })
     .catch(function (err) {
-        alert('網路錯誤：' + err);
+        document.getElementById('deleteConfirmError').innerText = '網路錯誤：' + err;
     });
 }
