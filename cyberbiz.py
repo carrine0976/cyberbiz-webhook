@@ -1043,6 +1043,7 @@ def Diysim_notify_esim():
         return jsonify({"code": "999", "mesg": "lpa not ready, needs manual check"})
     lpa, orderId = result
     qrcode_img = generate_qrcode(lpa)
+    
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
@@ -2352,7 +2353,27 @@ def manual_query_ftc(trans_id):
         "message": "供應商已回覆 esim 資訊，尚未寫入資料庫（僅查詢，未完成訂單）"
     })
 
+@app.route("/admin/templates/api/delete", methods=["POST"])
+def api_delete_template():
+    data = request.get_json(silent=True) or {}
+    PlanCode = (data.get("PlanCode") or "").strip()
 
+    if not PlanCode:
+        return jsonify({"success": False, "message": "PlanCode 不可為空"}), 400
+
+    if PlanCode == "default":
+        return jsonify({"success": False, "message": "default 樣板為系統預設 fallback，不可刪除"}), 400
+
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM email_templates WHERE PlanCode = ?", (PlanCode,))
+        deleted = cursor.rowcount
+        conn.commit()
+
+    if deleted == 0:
+        return jsonify({"success": False, "message": f"找不到 PlanCode={PlanCode} 的樣板"}), 404
+
+    return jsonify({"success": True, "message": f"已刪除樣板 PlanCode={PlanCode}"})
 @app.route("/favicon.png")
 def favicon():
     return send_file(os.path.join(BASE_DIR, "favicon.png"), mimetype="image/png")

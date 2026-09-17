@@ -270,6 +270,12 @@
                                     onclick="copyTemplate('{{ t.plan_code }}')">
                                 <i data-lucide="copy"></i>
                             </button>
+                            {% if t.plan_code != 'default' %}
+                                <button type="button" class="icon-btn" title="刪除"
+                                        onclick="deleteTemplate('{{ t.plan_code }}')">
+                                    <i data-lucide="trash-2"></i>
+                                </button>
+                                {% endif %}
                         </span>
                     </td>
                 </tr>

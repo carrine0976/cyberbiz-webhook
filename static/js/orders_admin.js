@@ -206,6 +206,7 @@ function saveModal() {
                     '<button type="button" class="icon-btn" title="編輯" onclick="openModal(\'' + pc + '\')"><i data-lucide="pencil"></i></button>' +
                     '<a href="/admin/templates/preview/' + pc + '" target="_blank" class="icon-btn" title="預覽"><i data-lucide="eye"></i></a>' +
                     '<button type="button" class="icon-btn" title="複製" onclick="copyTemplate(\'' + pc + '\')"><i data-lucide="copy"></i></button>' +
+                    '<button type="button" class="icon-btn" title="刪除" onclick="deleteTemplate(\'' + pc + '\')"><i data-lucide="trash-2"></i></button>' +
                     '</span>' +
                     '</td>';
                 table.appendChild(tr);
@@ -287,4 +288,31 @@ function getEditorHtmlWithPlaceholders() {
         el.replaceWith('[[' + el.getAttribute('data-key') + ']]');
     });
     return temp.innerHTML;
+}
+function deleteTemplate(pc) {
+    if (!confirm('確定要刪除樣板「' + pc + '」嗎？此操作無法復原。')) {
+        return;
+    }
+    fetch('/admin/templates/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ PlanCode: pc })
+    })
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+        if (data.success) {
+            var row = document.getElementById('row-' + pc);
+            if (row) {
+                row.remove();
+            }
+            if (window.TEMPLATES) {
+                delete window.TEMPLATES[pc];
+            }
+        } else {
+            alert(data.message);
+        }
+    })
+    .catch(function (err) {
+        alert('網路錯誤：' + err);
+    });
 }
