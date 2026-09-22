@@ -703,15 +703,26 @@ def JOYTEL_order_esim(order_id, planCode, email, trans_id, order_id_for_close_cy
             t.start()
 
         else:
-            error_msg = f"code={response.json().get('code')}: {response.text}"[:200]
+            res_code = response.json().get("code")
+            error_msg = f"code={res_code}: {response.text}"[:200]
             logging.error(f"供應商回應失敗 code={response.json().get('code')} 內容={response.text}")
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE orders SET status = 'pending', NOTE = ?, JOYTEL_orderTid = ? WHERE Trans_id = ?",
-                    (error_msg, orderTid, trans_id)
-                )
-                conn.commit()
+                if res_code == 5:
+                    # 訂單已存在於供應商端，代表之前很可能已經送出成功、
+                    # 背景可能還有 poll_joytel 在跑，絕對不能把狀態改回 pending，
+                    # 否則會讓正在跑的輪詢查不到 processing 記錄而悄悄中斷
+                    cursor.execute(
+                        "UPDATE orders SET NOTE = ?, JOYTEL_orderTid = ? WHERE Trans_id = ? AND status != 'completed'",
+                        (error_msg + " (訂單已存在，狀態保持不變，等待原輪詢完成)", orderTid, trans_id)
+                    )
+                    logging.warning(f"trans_id={trans_id} code=5，狀態刻意不變更，避免中斷可能存在的背景輪詢")
+                else:
+                    cursor.execute(
+                        "UPDATE orders SET status = 'pending', NOTE = ?, JOYTEL_orderTid = ? WHERE Trans_id = ?",
+                        (error_msg, orderTid, trans_id)
+                    )
+                    conn.commit()
 
     except Exception as e:
         logging.error(f"呼叫供應商API失敗: {e}")
@@ -1698,6 +1709,9 @@ def Query_Status():
     status_result = None
     usage_result = None
     error_msg = None
+    qc = None
+    BusinessSn_query = None
+    OrderId_query = None
 
     if CID_query and not re.match(r'^[A-Za-z0-9_\-]{1,64}$', CID_query):
         error_msg = "CID 格式不正確，請重新輸入。"
@@ -1707,18 +1721,19 @@ def Query_Status():
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-            SELECT o.qc
+            SELECT o.qc, o.BUSINESSN, o.ORDER_ID_DIYSIM
             FROM orders o
             LEFT JOIN CID_TABLE c ON o.Trans_id = c.Trans_id
             WHERE c.CID = ?
             LIMIT 1
             """, (CID_query,))
-            qc = None
             row = cursor.fetchone()
             if row:
-                qc = row[0]
+                qc, BusinessSn_query, OrderId_query = row
 
-        if qc is None or qc == 'AUTO001':
+        if qc is not None and qc not in QUERY_ENABLED_VENDORS:
+            error_msg = "此商品暫不提供線上查詢，請洽客服 LINE ID @uup3894y"
+        elif qc is None or qc == 'AUTO001':
             trans_id_status = uuid.uuid4().hex
             RSP_Query_API = f"{Base_URL}/openapi/esim/status/query"
             RSP_Usage_API = f"{Base_URL}/openapi/esim/usage/query"
@@ -1768,7 +1783,64 @@ def Query_Status():
                     logging.warning(f"usage 請求失敗: code={j2.get('code')}, mesg={j2.get('mesg')}")
             except Exception as e:
                 logging.error(f"流量查詢異常：{e}")
-        else:
+        elif qc == 'AUTO004':
+            Diysim_Usage_API = f"{Base_Diysim_URL}/api/order/usage"
+            timestamp = str(int(time.time() * 1000))
+            request_id = str(uuid.uuid4()).replace("-", "")[:20]
+
+            payload = {"iccid": CID_query}
+            if OrderId_query:
+                payload["orderId"] = OrderId_query
+
+            request_body = json.dumps(payload, separators=(',', ':'))
+            raw = timestamp + request_id + request_body + VENDOR4_AccessSecret
+            signature = hashlib.sha256(raw.encode()).hexdigest()
+            logging.info(f"VENDOR4_Access_Key: {VENDOR4_Access_Key}")
+            logging.info(f"VENDOR4_AccessSecret 長度: {len(VENDOR4_AccessSecret) if VENDOR4_AccessSecret else 'None'}")
+
+            headers = {
+                "Access-Key": VENDOR4_Access_Key,
+                "Signature": signature,
+                "Request-Id": request_id,
+                "Timestamp": timestamp,
+                "Content-Type": "application/json",
+            }
+            try:
+                response = requests.post(Diysim_Usage_API, data=request_body, headers=headers, timeout=60)
+                result = response.json()
+                logging.info(f"Diysim usage 查詢回應: {response.text}")
+
+                if result.get("code") == 0:
+                    data_list = result.get("data") or []
+                    if data_list:
+                        item = data_list[0]
+                        total_mb = item.get("total", 0)
+                        consumption_mb = item.get("consumption", 0)
+                        remaining_mb = item.get("remaining", item.get("remaing", 0))  
+                        eff_time_raw = item.get("effTime")  
+
+                        usage_result = {
+                            "CurrentUsage": consumption_mb * 1024 * 1024, 
+                            "TotalUsage": total_mb * 1024 * 1024,
+                            "remainingUsage": remaining_mb * 1024 * 1024,
+                            "effTime": eff_time_raw,
+                            "expTime": 0,
+                            "dataUsageList": []  
+                        }
+                        status_result = {
+                            "status": "1", 
+                            "state": "-",
+                            "statusTime": eff_time_raw,
+                        }
+                    else:
+                        error_msg = "查無此 ICCID 對應的用量資料"
+                else:
+                    error_msg = f"狀態查詢失敗：{result.get('msg')}"
+
+            except Exception as e:
+                error_msg = f"狀態查詢異常：{e}"
+
+        elif qc == 'AUTO002':
             FTC_Usage_API = "https://zdfjzyhdcl.execute-api.ap-northeast-1.amazonaws.com/prod/v1/checkBalance"
             FTC_Query_API = "https://zdfjzyhdcl.execute-api.ap-northeast-1.amazonaws.com/prod/v1/getStatus"
             trans_id = None
@@ -1816,9 +1888,9 @@ def Query_Status():
                         logging.info(f"請求成功 {response_2.text}")
                         usage_list = response_2.json().get("data")[0].get("dataUsageList", [])
                         usage_result = {
-                            "totalUsage": sum(int(i.get("usage", 0)) for i in usage_list),
-                            "effTime": 0,
-                            "expTime": 0,
+                            "CurrentUsage": sum(int(i.get("usage", 0)) for i in usage_list),
+                            "TotalUsage": 0,
+                            "remainingUsage": 0,
                             "dataUsageList": usage_list
                         }
                     else:
@@ -1828,7 +1900,12 @@ def Query_Status():
                     logging.error(f"狀態查詢異常：{e}")
 
     status_label = {"0": "未知", "1": "已激活", "2": "已失效"}
-
+    def fmt_diysim_time(ts_str):
+        try:
+            dt = datetime.datetime.strptime(str(ts_str), "%Y%m%d%H%M%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts_str) if ts_str else "-"
     def fmt_bytes(b):
         try:
             b = int(b)
@@ -1867,12 +1944,19 @@ def Query_Status():
 
     usage_html = ""
     if usage_result:
-        total = fmt_bytes(usage_result.get("totalUsage", 0))
-        eff = fmt_time(usage_result.get("effTime", 0))
-        expTime = fmt_time(usage_result.get("expTime", 0))
-
-        usage_html = f"""
-        <tr><td colspan='4'>總用量：{total}　生效：{eff}　到期：{expTime}   <span style="color:red;">＊注意：每日用量更新時間為 台灣凌晨12點。 國外與台灣有時差請特別注意</span></td></tr>"""
+        if qc == 'AUTO004':
+            total_display = fmt_bytes(usage_result.get("TotalUsage", 0))
+            used_display = fmt_bytes(usage_result.get("CurrentUsage", 0))
+            remaining_display = fmt_bytes(usage_result.get("remainingUsage", 0))
+            eff = fmt_diysim_time(usage_result.get("effTime"))
+            usage_html = f"""
+            <tr><td colspan='4'>總流量：{total_display}　已用：{used_display}　剩餘：{remaining_display}　生效：{eff}</td></tr>"""
+        else:
+            total = fmt_bytes(usage_result.get("totalUsage", 0))
+            eff = fmt_time(usage_result.get("effTime", 0))
+            expTime = fmt_time(usage_result.get("expTime", 0))
+            usage_html = f"""
+            <tr><td colspan='4'>總用量：{total}　生效：{eff}　到期：{expTime}   <span style="color:red;">＊注意：每日用量更新時間為 台灣凌晨12點。 國外與台灣有時差請特別注意</span></td></tr>"""
 
         for d in usage_result.get("dataUsageList", []):
             date = d.get("usageDate", "-")
@@ -1889,6 +1973,10 @@ def Query_Status():
     status_html = ""
     if status_result:
         s = status_result.get("status", "-")
+        if qc == 'AUTO004':
+            status_time_display = fmt_diysim_time(status_result.get("statusTime"))
+        else:
+            status_time_display = fmt_time(status_result.get("statusTime", "-"))
         status_html = f"""
         <table style="border-collapse:collapse; width:100%; background:#fff; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,0.07); margin-bottom:24px;">
             <tr>
@@ -1900,7 +1988,7 @@ def Query_Status():
             <tr>
                 <td style="padding:10px 14px; border:1px solid #e2e5ea;">{status_label.get(s, s)}</td>
                 <td style="padding:10px 14px; border:1px solid #e2e5ea;">{status_result.get("state", "-")}</td>
-                <td style="padding:10px 14px; border:1px solid #e2e5ea;">{fmt_time(status_result.get("statusTime", "-"))}</td>
+                <td style="padding:10px 14px; border:1px solid #e2e5ea;">{status_time_display}</td>
                 <td style="padding:10px 14px; border:1px solid #e2e5ea;">{Title or "-"}</td>
             </tr>
         </table>"""
@@ -1932,11 +2020,12 @@ def Query_Status():
         </form>
         {"<p style='color:red;'>⚠️ " + error_msg + "</p>" if error_msg else ""}
         {status_html}
-        {"<h3>用量明細</h3><table><tr><th>日期</th><th colspan='2'>用量</th></tr>" + usage_html + "</table>" if CID_query else ""}
+        {"<h3>用量明細</h3><table><tr><th>日期</th><th colspan='2'>用量</th></tr>" + usage_html + "</table>" if CID_query and not error_msg else ""}
     </body>
     </html>
     """
     return html
+
 
 
 @app.route("/test_line_items")
@@ -2234,14 +2323,14 @@ def scheduled_check_stuck_orders():
     """
     排程用：檢查卡住太久的訂單。
     - pending 超過 60 分鐘：安全，呼叫既有的 /retry 端點重新觸發下單
-    - processing 超過 3 小時：
+    - processing 超過 1 小時：
         - AUTO002 (FTC)：呼叫 /retry_poll 接續查詢（不重新下單）
         - AUTO003 (JOYTEL) 且有 orderCode/orderTid：呼叫 /retry_poll_joytel 接續查詢（不重新下單）
         - 其他情況：只記錄下來讓人工介入，避免重複下單風險
     """
     now = datetime.datetime.now()
-    pending_cutoff = (now - datetime.timedelta(minutes=60)).strftime("%Y-%m-%dT%H:%M:%S")
-    processing_cutoff = (now - datetime.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    pending_cutoff = (now - datetime.timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M:%S")
+    processing_cutoff = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
 
     retried_pending = []
     retried_ftc_poll = []
@@ -2277,7 +2366,7 @@ def scheduled_check_stuck_orders():
     for trans_id, qc, orderCode, orderTid, note in processing_rows:
         if qc == "AUTO002":
             # FTC → 接續查詢，不重新下單
-            logging.warning(f"[排程] 訂單 {trans_id} (FTC) 卡在 processing 超過3小時，呼叫 /retry_poll 接續查詢")
+            logging.warning(f"[排程] 訂單 {trans_id} (FTC) 卡在 processing 超過1小時，呼叫 /retry_poll 接續查詢")
             try:
                 requests.get(f"{request.host_url.rstrip('/')}/retry_poll/{trans_id}", timeout=10)
                 retried_ftc_poll.append(trans_id)
@@ -2286,7 +2375,7 @@ def scheduled_check_stuck_orders():
 
         elif qc == "AUTO003" and orderCode and orderTid:
             # JOYTEL 且有訂單編號 → 接續查詢，不重新下單
-            logging.warning(f"[排程] 訂單 {trans_id} (JOYTEL) 卡在 processing 超過3小時，呼叫 /retry_poll_joytel 接續查詢")
+            logging.warning(f"[排程] 訂單 {trans_id} (JOYTEL) 卡在 processing 超過1小時，呼叫 /retry_poll_joytel 接續查詢")
             try:
                 requests.get(f"{request.host_url.rstrip('/')}/retry_poll_joytel/{trans_id}", timeout=10)
                 retried_joytel_poll.append(trans_id)
@@ -2295,7 +2384,7 @@ def scheduled_check_stuck_orders():
 
         else:
             # 其他供應商，或 JOYTEL 但缺 orderCode/orderTid → 只記錄，人工介入
-            logging.warning(f"[排程] 訂單 {trans_id} 卡在 processing 超過3小時，qc={qc} orderCode={orderCode} orderTid={orderTid}，需人工檢查")
+            logging.warning(f"[排程] 訂單 {trans_id} 卡在 processing 超過1小時，qc={qc} orderCode={orderCode} orderTid={orderTid}，需人工檢查")
             stuck_processing.append({"trans_id": trans_id, "qc": qc, "orderCode": orderCode, "orderTid": orderTid, "note": note})
 
     return jsonify({
