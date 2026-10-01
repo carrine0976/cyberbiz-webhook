@@ -24,6 +24,7 @@ from io import BytesIO
 import re
 import functools
 from dotenv import load_dotenv
+from urllib.parse import quote
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "orders.db")
 load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
@@ -69,7 +70,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
+QUERY_ENABLED_VENDORS = {"AUTO001", "AUTO004"}   
 AUTO_VENDOR = ["AUTO001", "AUTO002", "AUTO003", "AUTO004", "AUTO005"]
 APP_ID = os.environ.get("APP_ID")
 APP_SECRET = os.environ.get("APP_SECRET")
@@ -121,7 +122,9 @@ def init_db():
         CUSTOMER_NAME TEXT,
         BUSINESSN TEXT,
         JOYTEL_orderCode TEXT,
-        JOYTEL_orderTid TEXT
+        JOYTEL_orderTid TEXT,
+        ORDER_ID_DIYSIM TEXT,
+        LPA TEXT
         )
         """)
         cursor.execute("PRAGMA table_info(orders)")
@@ -149,6 +152,10 @@ def init_db():
             cursor.execute("ALTER TABLE orders ADD COLUMN JOYTEL_orderCode TEXT")
         if "JOYTEL_orderTid" not in columns:
             cursor.execute("ALTER TABLE orders ADD COLUMN JOYTEL_orderTid TEXT")
+        if "ORDER_ID_DIYSIM" not in columns:
+            cursor.execute("ALTER TABLE orders ADD COLUMN ORDER_ID_DIYSIM TEXT")
+        if "LPA" not in columns:
+            cursor.execute("ALTER TABLE orders ADD COLUMN LPA TEXT")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS CID_TABLE (
@@ -607,8 +614,8 @@ def poll_lpa(trans_id, order_id_for_close_cyberbiz):
                 "INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (cid, trans_id)
             )
             cursor.execute(
-                "UPDATE orders SET status='completed', qrcode=? WHERE Trans_id=?",
-                (qrcode_url, trans_id)
+                "UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?",
+                (qrcode_url, lpa, trans_id)
             )
             conn.commit()
             cursor.execute("""
@@ -633,8 +640,9 @@ def poll_lpa(trans_id, order_id_for_close_cyberbiz):
                     cid_row = cursor.fetchone()
                     cid_list.append(cid_row[0] if cid_row else None)
 
+                qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
                 logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-                send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list)
+                send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
             else:
                 logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
 
@@ -722,7 +730,7 @@ def JOYTEL_order_esim(order_id, planCode, email, trans_id, order_id_for_close_cy
                         "UPDATE orders SET status = 'pending', NOTE = ?, JOYTEL_orderTid = ? WHERE Trans_id = ?",
                         (error_msg, orderTid, trans_id)
                     )
-                    conn.commit()
+                conn.commit()
 
     except Exception as e:
         logging.error(f"呼叫供應商API失敗: {e}")
@@ -843,7 +851,7 @@ def poll_joytel(trans_id, orderTid, order_id_for_close_cyberbiz, orderCode):
                 email, full_title, order_id, qty_index, order_id_for_close_cyberbiz, line_items_id, PlanCode = row
 
                 cursor.execute("INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (sn_code, trans_id))
-                cursor.execute("UPDATE orders SET status='completed', qrcode=? WHERE Trans_id=?", (qrcode_img, trans_id))
+                cursor.execute("UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?", (qrcode_img, qr_code, trans_id))
                 conn.commit()
 
                 logging.info(f"JOYTEL 單張完成 trans_id={trans_id} sn_code={sn_code}")
@@ -869,8 +877,9 @@ def poll_joytel(trans_id, orderTid, order_id_for_close_cyberbiz, orderCode):
                         cid_row = cursor.fetchone()
                         cid_list.append(cid_row[0] if cid_row else None)
 
+                    qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
                     logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-                    send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list)
+                    send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
                 else:
                     logging.info(f"line_items_id={line_items_id} 尚有 {remaining} 筆未完成，等待中")
 
@@ -907,12 +916,23 @@ def notify_esim():
     qrcode_type = esim_data.get("qrcodeType")
     qrcode = esim_data.get("qrcode")
     plan_code = esim_data.get("planCode")
+    smdp = esim_data.get("smdp")
+    at_code = esim_data.get("atCode")
+    cf_code = esim_data.get("cfCode")
 
     logging.info(f"transId: {trans_id}")
     logging.info(f"CID: {cid}")
     logging.info(f"qrcodeType: {qrcode_type}")
     logging.info(f"qrcode: {qrcode}")
     logging.info(f"transId: {trans_id}, CID: {cid}, planCode: {plan_code}")
+
+    if qrcode_type == 1 and qrcode:
+        lpa_text = qrcode
+    elif smdp and at_code and str(cf_code) == "000":
+        lpa_text = f"LPA:1${smdp}${at_code}"
+    else:
+        lpa_text = None
+        logging.info(f"RSP 無法組出 LPA trans_id={trans_id} smdp={smdp} cfCode={cf_code}")
 
     if qrcode_type == 1:
         qrcode_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={qrcode}"
@@ -936,8 +956,8 @@ def notify_esim():
         email, full_title, order_id, qty_index, order_id_for_close_cyberbiz, line_items_id, PlanCode = row
 
         cursor.execute(
-            "UPDATE orders SET status='completed', qrcode=? WHERE Trans_id=?",
-            (qrcode_url, trans_id)
+            "UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?",
+            (qrcode_url, lpa_text, trans_id)
         )
         cursor.execute(
             "INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (cid, trans_id)
@@ -965,8 +985,10 @@ def notify_esim():
                 cursor.execute("SELECT CID FROM CID_TABLE WHERE Trans_id = ?", (tid,))
                 cid_row = cursor.fetchone()
                 cid_list.append(cid_row[0] if cid_row else None)
+
+            qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
             logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list)
+            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
         else:
             logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
 
@@ -1014,9 +1036,10 @@ def query_diysim_order(cid=None, businessSn=None):
         status = item.get("status")
         lpa = item.get("lpa")
         orderId = item.get("orderId")
+        iccid = item.get("iccid")
 
         if status == 4 and lpa:
-            return lpa, orderId
+            return lpa, orderId, iccid
         else:
             logging.info(f"Diysim 訂單 orderId={orderId} 狀態尚未完成 status={status}")
             return None
@@ -1052,15 +1075,15 @@ def Diysim_notify_esim():
     if not result:
         logging.error(f"webhook 收到通知但查詢 lpa 多次仍失敗 businessSn={businessSn}，需人工檢查")
         return jsonify({"code": "999", "mesg": "lpa not ready, needs manual check"})
-    lpa, orderId = result
+    lpa, orderId, _ = result
     qrcode_img = generate_qrcode(lpa)
     
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE orders SET status='completed', qrcode=? WHERE BUSINESSN=? AND status='processing'",
-            (qrcode_img, businessSn)
+            "UPDATE orders SET status='completed', qrcode=?, LPA=?, ORDER_ID_DIYSIM=? WHERE BUSINESSN=? AND status='processing'",
+            (qrcode_img, lpa, orderId, businessSn)
         )
         if cursor.rowcount == 0:
             logging.info(f"businessSn={businessSn} 已被輪詢或其他流程完成，webhook 略過")
@@ -1106,8 +1129,9 @@ def Diysim_notify_esim():
                 cid_row = cursor.fetchone()
                 cid_list.append(cid_row[0] if cid_row else None)
 
+            qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
             logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list) 
+            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
         else:
             logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
         logging.info(f"Diysim 訂購完成 order_id={order_id} trans_id={trans_id}")
@@ -1163,8 +1187,8 @@ def wugelinebot_order_esim(order_id, planCode, email, trans_id, order_id_for_clo
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE orders SET status='completed', qrcode=? WHERE Trans_id=?",
-                    (qrcode_img, trans_id)
+                    "UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?",
+                    (qrcode_img, lpa, trans_id)
                 )
                 conn.commit()
 
@@ -1189,9 +1213,10 @@ def wugelinebot_order_esim(order_id, planCode, email, trans_id, order_id_for_clo
                             WHERE order_id = ? AND line_items_id = ?
                             ORDER BY qty_index ASC
                         """, (order_id_, line_items_id))
-                        qrcode_list = [r[0] for r in cursor.fetchall()]
+
+                        qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id_, line_items_id)
                         logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-                        send_order_email(email_, qrcode_list, full_title, PlanCode=PlanCode)
+                        send_order_email(email_, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
                     else:
                         logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
 
@@ -1256,8 +1281,35 @@ def add_text_to_QRcode(qrcode_url, product_name, cid=None):
     img_byte.seek(0)
 
     return img_byte.read()
+def collect_item_email_data(cursor, order_id, line_items_id):
+    """依 qty_index 順序取出同一個商品項目的 qrcode / CID / LPA，六個寄信處共用"""
+    cursor.execute("""
+        SELECT o.qrcode,
+               (SELECT c.CID FROM CID_TABLE c WHERE c.Trans_id = o.Trans_id LIMIT 1),
+               o.LPA
+        FROM orders o
+        WHERE o.order_id = ? AND o.line_items_id = ?
+        ORDER BY o.qty_index ASC
+    """, (order_id, line_items_id))
+    rows = cursor.fetchall()
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
 
-def send_order_email(to_email, qrcode_url_list, product_name, PlanCode=None, cid_list=None):
+def build_install_button(lpa, idx):
+    if not lpa:
+        return ""
+    lpa = lpa.strip()
+    if lpa.startswith("1$"):
+        lpa = "LPA:" + lpa
+    if not lpa.upper().startswith("LPA:"):
+        return ""
+    link = "https://esimsetup.apple.com/esim_qrcode_provisioning?carddata=" + quote(lpa, safe=":$")
+    return (
+        f'<p><a href="{link}" style="display:inline-block;padding:12px 24px;'
+        f'background:#007aff;color:#ffffff;text-decoration:none;border-radius:8px;'
+        f'font-weight:bold;">📲 iPhone 一鍵安裝（第 {idx+1} 張）</a></p>'
+    )
+
+def send_order_email(to_email, qrcode_url_list, product_name, PlanCode=None, cid_list=None, lpa_list=None):
     from_email = "wuge.esim@wuge.com.tw"
     app_password = os.environ.get("GMAIL_PASSWORD")
     #pdf_path = "/root/app/cyberbiz-webhook/2026年版 eSIM iphone 設定.pdf"
@@ -1270,11 +1322,22 @@ def send_order_email(to_email, qrcode_url_list, product_name, PlanCode=None, cid
         msg = MIMEMultipart()
 
         qrcode_html_blocks = ""
+        has_button = False
         for idx, _ in enumerate(qrcode_url_list):
+            lpa = lpa_list[idx] if lpa_list and idx < len(lpa_list) else None
+            btn = build_install_button(lpa, idx)
+            has_button = has_button or bool(btn)
             qrcode_html_blocks += f"""
             <p><strong>第 {idx+1} 張 QR Code：</strong></p>
+            {btn}
             <img src="cid:qrcode_{idx}" style="width:220px;"><br><br>
             """
+        if has_button:
+            qrcode_html_blocks = (
+                '<p style="color:#666;font-size:13px;">iPhone（iOS 17.4 以上）請在要安裝的手機上直接點按鈕；'
+                '其他裝置或用電腦收信，請用 QR Code。按鈕與 QR Code 是同一組，安裝過一次即失效。</p>'
+                + qrcode_html_blocks
+            )
         subject, body_html = render_email(PlanCode, product_name, len(qrcode_url_list), qrcode_html_blocks)
 
         msg['Subject'] = subject
@@ -2027,7 +2090,6 @@ def Query_Status():
     return html
 
 
-
 @app.route("/test_line_items")
 def test_line_items():
     order_id_query = request.args.get("order_id")
@@ -2227,15 +2289,15 @@ def retry_poll_diysim(trans_id):
             "message": "供應商目前尚未回覆 lpa，稍後再查"
         })
 
-    lpa, orderId = result
+    lpa, orderId, iccid = result
     qrcode_img = generate_qrcode(lpa)
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
 
         cursor.execute(
-            "UPDATE orders SET status='completed', qrcode=? WHERE Trans_id=? AND status='processing'",
-            (qrcode_img, trans_id)
+            "UPDATE orders SET status='completed', qrcode=?, ORDER_ID_DIYSIM=?, LPA=? WHERE Trans_id=? AND status='processing'",
+            (qrcode_img, orderId, lpa, trans_id)
         )
         if cursor.rowcount == 0:
             logging.info(f"trans_id={trans_id} 已被 webhook 或其他流程完成，略過")
@@ -2249,7 +2311,10 @@ def retry_poll_diysim(trans_id):
         row2 = cursor.fetchone()
         email, full_title, order_id, qty_index, order_id_for_close_cyberbiz, line_items_id, PlanCode = row2
 
-        cursor.execute("INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (orderId, trans_id))
+        if iccid:
+            cursor.execute("INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (iccid, trans_id))
+        else:
+            logging.warning(f"list API 沒有回傳 iccid，未寫入 CID_TABLE trans_id={trans_id} orderId={orderId}")
         conn.commit()
 
         cursor.execute("""
@@ -2273,8 +2338,9 @@ def retry_poll_diysim(trans_id):
                 cid_row = cursor.fetchone()
                 cid_list.append(cid_row[0] if cid_row else None)
 
+            qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
             logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list)
+            send_order_email(email, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
         else:
             logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
 
@@ -2463,6 +2529,20 @@ def api_delete_template():
         return jsonify({"success": False, "message": f"找不到 PlanCode={PlanCode} 的樣板"}), 404
 
     return jsonify({"success": True, "message": f"已刪除樣板 PlanCode={PlanCode}"})
+
+@app.route("/test_send_email")
+def test_send_email():
+    fake_qrcode = generate_qrcode("LPA:1$test.example.com$ABC-DEF-GHI")
+    send_order_email(
+        to_email="carrine0976@gmail.com",
+        qrcode_url_list=[fake_qrcode],
+        product_name="測試商品",
+        PlanCode="default",
+        cid_list=["8988888888888888888"],
+        lpa_list=["LPA:1$test.example.com$ABC-DEF-GHI"]
+    )
+    return "測試信已寄出"
+
 @app.route("/favicon.png")
 def favicon():
     return send_file(os.path.join(BASE_DIR, "favicon.png"), mimetype="image/png")
@@ -2470,4 +2550,4 @@ def favicon():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
