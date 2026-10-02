@@ -350,7 +350,7 @@ def order_esim(order_id, planCode, email, trans_id, order_id_for_close_cyberbiz)
         conn.commit()
         
 
-    payload = {"planCode": planCode, "qrcodeType": 0, "email": email}
+    payload = {"planCode": planCode, "qrcodeType": 1, "email": email}
     headers = {
         "Content-Type": "application/json",
         "AppId": APP_ID,
@@ -928,16 +928,14 @@ def notify_esim():
 
     if qrcode_type == 1 and qrcode:
         lpa_text = qrcode
+        qrcode_url = generate_qrcode(qrcode)
     elif smdp and at_code and str(cf_code) == "000":
         lpa_text = f"LPA:1${smdp}${at_code}"
+        qrcode_url = generate_qrcode(lpa_text)
     else:
         lpa_text = None
-        logging.info(f"RSP 無法組出 LPA trans_id={trans_id} smdp={smdp} cfCode={cf_code}")
-
-    if qrcode_type == 1:
-        qrcode_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={qrcode}"
-    else:
-        qrcode_url = qrcode
+        qrcode_url = qrcode  
+        logging.info(f"RSP 無法組出 LPA trans_id={trans_id} smdp={smdp} atCode={'有' if at_code else '無'} cfCode={cf_code!r}")
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
@@ -1144,105 +1142,116 @@ def wugelinebot_order_esim(order_id, planCode, email, trans_id, order_id_for_clo
         "Authorization": f"Bearer {WUGELINEBOT_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "planCode": planCode,
-        "externalOrderRef": trans_id,
-        "quantity": 1,
-        "qrcodeType": 1
-    }
-
+    NON_RETRYABLE_CODES = set()
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE orders SET status = 'processing' WHERE Trans_id = ? AND status IN ('pending', 'Failed')",
-            (trans_id,)
-        )
-        if cursor.rowcount == 0:
-            logging.info(f"trans_id={trans_id} 已經在 processing/completed，跳過重複送出")
+        cursor.execute("SELECT line_items_id FROM orders WHERE Trans_id = ?", (trans_id,))
+        base = cursor.fetchone()
+
+        if not base:
+            logging.error(f"找不到 trans_id={trans_id}，WugaLineBot 下單中止")
             conn.commit()
             return
+        line_items_id = base[0]
+
+        cursor.execute("""
+            SELECT Trans_id FROM orders
+            WHERE order_id = ? AND line_items_id = ? AND qc = 'AUTO005'
+              AND status IN ('pending', 'Failed')
+            ORDER BY qty_index ASC
+        """, (order_id, line_items_id))
+        trans_ids = [r[0] for r in cursor.fetchall()]
+
+        if trans_id not in trans_ids:
+            logging.info(f"trans_id={trans_id} 已在 processing/completed（同組已被處理），跳過")
+            conn.commit()
+            return
+        
+        cursor.executemany(
+            "UPDATE orders SET status = 'processing' WHERE Trans_id = ?",
+            [(t,) for t in trans_ids]
+        )
         conn.commit()
+    n = len(trans_ids)
+    external_ref = re.sub(r"[#\s]", "-", f"{order_id}-{line_items_id}-q{n}")
+    payload = {
+            "planCode": planCode,
+            "externalOrderRef": external_ref,
+            "quantity": n,
+            "qrcodeType": 1
+        }
+    def mark_group(status, note=None, only_processing=True):
+        with sqlite3.connect(DB_PATH, timeout=30) as c:
+            cur = c.cursor()
+            for t in trans_ids:
+                if only_processing:
+                    cur.execute("UPDATE orders SET status=?, NOTE=COALESCE(?, NOTE) WHERE Trans_id=? AND status='processing'",
+                                (status, note, t))
+                else:
+                    cur.execute("UPDATE orders SET status=?, NOTE=COALESCE(?, NOTE) WHERE Trans_id=? AND status!='completed'",
+                                (status, note, t))
+            c.commit()
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         result = response.json()
 
         if result.get("code") == "000":
             items = result.get("data", {}).get("items") or []
-            if not items:
-                error_msg = "WugaLineBot 回應成功但 items 為空，未取得 LPA"
-                logging.error(f"WugaLineBot 回應成功但 items 為空 trans_id={trans_id}")
-                with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE orders SET status = 'Failed', NOTE = ? WHERE Trans_id = ? AND status = 'processing'",
-                            (error_msg, trans_id)
-                        )
-                        conn.commit()
+        
+            if len(items) != n:
+                error_msg = f"WugaLineBot 回傳筆數異常 expected={n} got={len(items)}"
+                logging.error(f"{error_msg} ref={external_ref} planCode={planCode}")
+                mark_group("Failed", error_msg)   # 可能已扣庫存，需人工確認
                 return
-            lpa = items[0]["qrcode"]
-            qrcode_img = generate_qrcode(lpa)
-            logging.info(f"WugaLineBot 訂購成功 order_id={order_id} planCode={planCode} trans_id={trans_id}")
+            logging.info(f"WugaLineBot 訂購成功 order_id={order_id} planCode={planCode} ref={external_ref} 共{n}張")
 
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?",
-                    (qrcode_img, lpa, trans_id)
-                )
+                for tid, item in zip(trans_ids, items):
+                    lpa = item["qrcode"]
+                    cid = item.get("cid") or item.get("iccid")
+                    qrcode_img = generate_qrcode(lpa)
+                    cursor.execute(
+                        "UPDATE orders SET status='completed', qrcode=?, LPA=? WHERE Trans_id=?",
+                        (qrcode_img, lpa, tid)
+                    )
+                    if cid:
+                        cursor.execute("DELETE FROM CID_TABLE WHERE Trans_id=?", (tid,))
+                        cursor.execute("INSERT INTO CID_TABLE (CID, Trans_id) VALUES (?, ?)", (str(cid), tid))
                 conn.commit()
 
-                # 依 line_items_id 判斷該商品項目是否全部完成，全部完成才合併寄信
+                cursor.execute("SELECT email, Title, PlanCode FROM orders WHERE Trans_id = ?", (trans_ids[0],))
+                email_, full_title, plan_code_ = cursor.fetchone()
                 cursor.execute("""
-                    SELECT email, Title, order_id, qty_index, order_id_for_close_cyberbiz, line_items_id, PlanCode
-                    FROM orders WHERE Trans_id = ?
-                """, (trans_id,))
-                row = cursor.fetchone()
-                if row:
-                    email_, full_title, order_id_, qty_index, close_id_, line_items_id, PlanCode = row
+                    SELECT COUNT(*) FROM orders
+                    WHERE order_id = ? AND line_items_id = ? AND status != 'completed'
+                """, (order_id, line_items_id))
+                remaining = cursor.fetchone()[0]
+                if remaining == 0:
+                    qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id, line_items_id)
+                # 寄信放在 DB 連線之外，避免 SMTP 慢時卡住資料庫
 
-                    cursor.execute("""
-                        SELECT COUNT(*) FROM orders
-                        WHERE order_id = ? AND line_items_id = ? AND status != 'completed'
-                    """, (order_id_, line_items_id))
-                    remaining_in_item = cursor.fetchone()[0]
-
-                    if remaining_in_item == 0:
-                        cursor.execute("""
-                            SELECT qrcode FROM orders
-                            WHERE order_id = ? AND line_items_id = ?
-                            ORDER BY qty_index ASC
-                        """, (order_id_, line_items_id))
-
-                        qrcode_list, cid_list, lpa_list = collect_item_email_data(cursor, order_id_, line_items_id)
-                        logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
-                        send_order_email(email_, qrcode_list, full_title, PlanCode=PlanCode, cid_list=cid_list, lpa_list=lpa_list)
-                    else:
-                        logging.info(f"line_items_id={line_items_id} 尚有 {remaining_in_item} 筆未完成，等待中")
-
-            logging.info(f"訂購esim完成 order_id={order_id} trans_id={trans_id}")
+            if remaining == 0:
+                logging.info(f"line_items_id={line_items_id} 全部完成，寄送含 {len(qrcode_list)} 張 QR code 的信")
+                send_order_email(email_, qrcode_list, full_title, PlanCode=plan_code_, cid_list=cid_list, lpa_list=lpa_list)
+            else:
+                logging.info(f"line_items_id={line_items_id} 尚有 {remaining} 筆未完成，等待中")
+            logging.info(f"訂購esim完成 order_id={order_id} ref={external_ref}")
             check_and_close_order(order_id, order_id_for_close_cyberbiz)
-
+            
         else:
-            error_msg = f"code={result.get('code')}: {response.text}"[:200]
-            logging.error(f"WugaLineBot 訂購失敗 order_id={order_id} planCode={planCode} trans_id={trans_id} {error_msg}")
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE orders SET status = 'pending', NOTE = ? WHERE Trans_id = ? AND status != 'completed'",
-                    (error_msg, trans_id,)
-                )
-                conn.commit()
+            code = result.get("code")
+            error_msg = f"code={code}: {response.text}"[:200]
+            logging.error(f"WugaLineBot 訂購失敗 order_id={order_id} planCode={planCode} ref={external_ref} {error_msg}")
+            mark_group("Failed" if code in NON_RETRYABLE_CODES else "pending", error_msg, only_processing=False)
+
 
     except Exception as e:
+        # 同一組 ref+quantity+planCode 重送不會重複扣庫存，所以回 pending 是安全的
         logging.error(f"呼叫供應商API失敗: {e}")
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE orders SET status = 'pending' WHERE Trans_id = ? AND status = 'processing'",
-                (trans_id,)
-            )
-            conn.commit()
+        mark_group("pending", f"連線例外: {e}"[:200])
 
 def add_text_to_QRcode(qrcode_url, product_name, cid=None):
     if isinstance(qrcode_url, bytes):
