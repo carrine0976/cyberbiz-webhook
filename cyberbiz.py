@@ -2539,18 +2539,18 @@ def api_delete_template():
 
     return jsonify({"success": True, "message": f"已刪除樣板 PlanCode={PlanCode}"})
 
-@app.route("/test_send_email")
-def test_send_email():
-    fake_qrcode = generate_qrcode("LPA:1$test.example.com$ABC-DEF-GHI")
-    send_order_email(
-        to_email="carrine0976@gmail.com",
-        qrcode_url_list=[fake_qrcode],
-        product_name="測試商品",
-        PlanCode="default",
-        cid_list=["8988888888888888888"],
-        lpa_list=["LPA:1$test.example.com$ABC-DEF-GHI"]
-    )
-    return "測試信已寄出"
+@app.route("/api/order/<order_id>")
+def search_trans_id(order_id):
+    
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT Trans_id, qc, status, order_id_for_close_cyberbiz
+            FROM orders
+            WHERE order_id = ?
+        """, (order_id,))
+        rows = cursor.fetchall()
+    return jsonify({"orders": rows})
 
 @app.route("/favicon.png")
 def favicon():
