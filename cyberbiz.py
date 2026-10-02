@@ -2189,8 +2189,8 @@ def download_report():
     )
 
 
-@app.route("/retry/<trans_id>")
-def retry(trans_id):
+def trigger_retry(trans_id):
+    """重新觸發單筆訂單。回傳 (ok: bool, message: str)。"""
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -2199,21 +2199,14 @@ def retry(trans_id):
         )
         row = cursor.fetchone()
         if not row:
-            return jsonify({"error": "找不到訂單"})
+            return False, "找不到訂單"
         close_id, qc, order_id, plan_code, email, current_status, existing_joytel_orderTid, businessSn = row
 
-        # AUTO003(JOYTEL) 若已經在 processing，代表已經跟供應商下過單、有 orderCode 在等 callback
-        # 這時候用 /retry 會清空狀態重新下單，導致對供應商重複下單，一律擋下改走 /retry_poll_joytel
+        # AUTO003(JOYTEL) 已在 processing：已向供應商下過單，不可重新下單
         if qc == "AUTO003" and current_status == "processing":
-            return jsonify({
-                "error": "此 AUTO003 訂單目前為 processing，已對供應商下過單，用 /retry 會導致重複下單",
-                "suggestion": f"請改用 /retry_poll_joytel/{trans_id} 接續查詢現有訂單狀態，不會重新下單"
-            })
+            return False, f"AUTO003 目前為 processing，請改用 /retry_poll_joytel/{trans_id}"
         if qc == "AUTO004" and current_status == "processing" and businessSn:
-            return jsonify({
-                "error": "此 AUTO004 訂單目前為 processing，已對供應商下過單，用 /retry 會導致重複下單",
-                "suggestion": f"請改用 /retry_poll_diysim/{trans_id} 接續查詢現有訂單狀態，不會重新下單"
-            })
+            return False, f"AUTO004 目前為 processing，請改用 /retry_poll_diysim/{trans_id}"
 
         cursor.execute(
             "UPDATE orders SET status = 'pending' WHERE Trans_id = ? AND status != 'completed'",
@@ -2222,30 +2215,35 @@ def retry(trans_id):
         conn.commit()
 
     if qc == "AUTO001":
-        t = threading.Thread(target=order_esim, args=(order_id, plan_code, email, trans_id, close_id))
+        target, args = order_esim, (order_id, plan_code, email, trans_id, close_id)
     elif qc == "AUTO002":
-        t = threading.Thread(target=FTC_order_esim, args=(order_id, plan_code, email, trans_id, close_id))
+        target, args = FTC_order_esim, (order_id, plan_code, email, trans_id, close_id)
     elif qc == "AUTO003":
-        # 若之前已經送出過、有記錄 orderTid，沿用同一組，交給供應商用 orderTid 判斷是否重複
-        # 只有從未送出過(orderTid 為 None)才讓函式自動產生新的一組
-        t = threading.Thread(
-            target=JOYTEL_order_esim,
-            args=(order_id, plan_code, email, trans_id, close_id, 0, existing_joytel_orderTid)
-        )
+        target, args = JOYTEL_order_esim, (order_id, plan_code, email, trans_id, close_id, 0, existing_joytel_orderTid)
     elif qc == "AUTO004":
-        t = threading.Thread(target=Diysim_order_esim, args=(order_id, plan_code, email, trans_id, close_id))
+        target, args = Diysim_order_esim, (order_id, plan_code, email, trans_id, close_id)
     elif qc == "AUTO005":
-            t = threading.Thread(target=wugelinebot_order_esim, args=(order_id, plan_code, email, trans_id, close_id))
-    else:
-        return jsonify({"error": f"未知廠商 {qc}"})
+        target, args = wugelinebot_order_esim, (order_id, plan_code, email, trans_id, close_id)
 
+    else:
+        return False, f"未知廠商 {qc}"
+
+    t = threading.Thread(target=target, args=args)
     t.daemon = True
     t.start()
-    return jsonify({"status": "ok", "message": f"重新觸發 {trans_id} (qc={qc})"})
+    return True, f"重新觸發 {trans_id} (qc={qc})"
 
 
-@app.route("/retry_poll/<trans_id>")
-def retry_poll(trans_id):
+@app.route("/retry/<trans_id>")
+def retry(trans_id):
+    ok, msg = trigger_retry(trans_id)
+    if not ok:
+        return jsonify({"error": msg})
+    return jsonify({"status": "ok", "message": msg})
+
+
+def trigger_poll_ftc(trans_id):
+    """FTC 接續查詢（不重新下單）。回傳 (ok, message)。"""
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -2253,18 +2251,25 @@ def retry_poll(trans_id):
             (trans_id,)
         )
         row = cursor.fetchone()
-        if not row:
-            return jsonify({"error": "找不到 processing 狀態的訂單"})
-        close_id, qc = row
-
+    if not row:
+        return False, "找不到 processing 狀態的訂單"
+    close_id, qc = row
     if qc != "AUTO002":
-        return jsonify({"error": f"此訂單廠商為 {qc}，不是 FTC"})
+        return False, f"此訂單廠商為 {qc}，不是 FTC"
 
     t = threading.Thread(target=poll_lpa, args=(trans_id, close_id))
     t.daemon = True
     t.start()
+    return True, f"已重新觸發 poll_lpa，trans_id={trans_id}"
 
-    return jsonify({"status": "ok", "message": f"已重新觸發 poll_lpa，trans_id={trans_id}"})
+
+@app.route("/retry_poll/<trans_id>")
+def retry_poll(trans_id):
+    ok, msg = trigger_poll_ftc(trans_id)
+    if not ok:
+        return jsonify({"error": msg})
+    return jsonify({"status": "ok", "message": msg})
+
 @app.route("/retry_poll_diysim/<trans_id>")
 def retry_poll_diysim(trans_id):
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -2357,8 +2362,9 @@ def retry_poll_diysim(trans_id):
         check_and_close_order(order_id, order_id_for_close_cyberbiz)
 
     return jsonify({"status": "ok", "message": f"trans_id={trans_id} 查詢成功並完成訂單"})
-@app.route("/retry_poll_joytel/<trans_id>")
-def retry_poll_joytel(trans_id):
+
+def trigger_poll_joytel(trans_id):
+    """JOYTEL 接續查詢（不重新下單）。回傳 (ok, message)。"""
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -2368,106 +2374,88 @@ def retry_poll_joytel(trans_id):
         row = cursor.fetchone()
 
     if not row:
-        return jsonify({"error": "找不到這個 trans_id"})
-
+        return False, "找不到這個 trans_id"
     qc, status, close_id, orderCode, orderTid = row
 
     if qc != "AUTO003":
-        return jsonify({"error": f"此訂單廠商為 {qc}，不是 AUTO003/JOYTEL"})
+        return False, f"此訂單廠商為 {qc}，不是 AUTO003/JOYTEL"
     if status != "processing":
-        return jsonify({"error": f"目前狀態為 {status}，不是 processing，不需要重新輪詢"})
+        return False, f"目前狀態為 {status}，不是 processing，不需要重新輪詢"
     if not orderCode or not orderTid:
-        return jsonify({"error": "找不到 orderCode/orderTid（可能是舊資料，欄位加入前下的單），無法接續查詢，只能用 /retry 重新下單"})
+        return False, "找不到 orderCode/orderTid，只能用 /retry 重新下單"
 
     with _active_joytel_polls_lock:
         if trans_id in _active_joytel_polls:
-            return jsonify({"error": "此 trans_id 已有輪詢在進行中，請稍後再試"})
+            return False, "此 trans_id 已有輪詢在進行中，請稍後再試"
 
     t = threading.Thread(target=poll_joytel, args=(trans_id, orderTid, close_id, orderCode))
     t.daemon = True
     t.start()
+    return True, f"已重新觸發 JOYTEL 輪詢，trans_id={trans_id} orderCode={orderCode}"
 
+
+@app.route("/retry_poll_joytel/<trans_id>")
+def retry_poll_joytel(trans_id):
+    ok, msg = trigger_poll_joytel(trans_id)
+    if not ok:
+        return jsonify({"error": msg})
     return jsonify({
         "status": "ok",
-        "message": f"已重新觸發 JOYTEL 輪詢，trans_id={trans_id} orderCode={orderCode}",
+        "message": msg,
         "note": "此操作只查詢現有訂單狀態，不會重新下單"
     })
 
 @app.route("/scheduled_check_stuck_orders")
 def scheduled_check_stuck_orders():
-    """
-    排程用：檢查卡住太久的訂單。
-    - pending 超過 60 分鐘：安全，呼叫既有的 /retry 端點重新觸發下單
-    - processing 超過 1 小時：
-        - AUTO002 (FTC)：呼叫 /retry_poll 接續查詢（不重新下單）
-        - AUTO003 (JOYTEL) 且有 orderCode/orderTid：呼叫 /retry_poll_joytel 接續查詢（不重新下單）
-        - 其他情況：只記錄下來讓人工介入，避免重複下單風險
-    """
-    now = datetime.datetime.now()
-    pending_cutoff = (now - datetime.timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M:%S")
-    processing_cutoff = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"error": "forbidden"}), 403
 
-    retried_pending = []
-    retried_ftc_poll = []
-    retried_joytel_poll = []
-    stuck_processing = []
+    now = datetime.datetime.now()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    pending_cutoff = (now - datetime.timedelta(minutes=60)).strftime(fmt)
+    processing_cutoff = (now - datetime.timedelta(hours=1)).strftime(fmt)
+
+    retried_pending, retried_ftc_poll, retried_joytel_poll, stuck = [], [], [], []
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
-
         cursor.execute("""
             SELECT Trans_id FROM orders
-            WHERE status = 'pending' AND Created_AT < ? AND qc = 'AUTO003'
+            WHERE status='pending' AND Created_AT < ? AND qc = 'AUTO003'
         """, (pending_cutoff,))
-        pending_trans_ids = [r[0] for r in cursor.fetchall()]
+        pending_ids = [r[0] for r in cursor.fetchall()]
 
         cursor.execute("""
             SELECT Trans_id, qc, JOYTEL_orderCode, JOYTEL_orderTid, NOTE
             FROM orders
-            WHERE status = 'processing' AND Created_AT < ? AND qc = 'AUTO003'
+            WHERE status='processing' AND Created_AT < ? AND qc IN ('AUTO002','AUTO003')
         """, (processing_cutoff,))
         processing_rows = cursor.fetchall()
 
-    # pending 太久 → 呼叫既有 /retry
-    for trans_id in pending_trans_ids:
-        logging.warning(f"[排程] 訂單 {trans_id} 卡在 pending 超過60分鐘，呼叫 /retry 重新觸發")
-        try:
-            requests.get(f"{request.host_url.rstrip('/')}/retry/{trans_id}", timeout=10)
-            retried_pending.append(trans_id)
-        except Exception as e:
-            logging.error(f"[排程] 呼叫 /retry/{trans_id} 失敗: {e}")
+    for tid in pending_ids:
+        ok, msg = trigger_retry(tid)
+        logging.warning(f"[排程] pending 重試 {tid}: {msg}")
+        if ok:
+            retried_pending.append(tid)
 
-    # processing 太久
-    for trans_id, qc, orderCode, orderTid, note in processing_rows:
+    for tid, qc, code, otid, note in processing_rows:
         if qc == "AUTO002":
-            # FTC → 接續查詢，不重新下單
-            logging.warning(f"[排程] 訂單 {trans_id} (FTC) 卡在 processing 超過1小時，呼叫 /retry_poll 接續查詢")
-            try:
-                requests.get(f"{request.host_url.rstrip('/')}/retry_poll/{trans_id}", timeout=10)
-                retried_ftc_poll.append(trans_id)
-            except Exception as e:
-                logging.error(f"[排程] 呼叫 /retry_poll/{trans_id} 失敗: {e}")
-
-        elif qc == "AUTO003" and orderCode and orderTid:
-            # JOYTEL 且有訂單編號 → 接續查詢，不重新下單
-            logging.warning(f"[排程] 訂單 {trans_id} (JOYTEL) 卡在 processing 超過1小時，呼叫 /retry_poll_joytel 接續查詢")
-            try:
-                requests.get(f"{request.host_url.rstrip('/')}/retry_poll_joytel/{trans_id}", timeout=10)
-                retried_joytel_poll.append(trans_id)
-            except Exception as e:
-                logging.error(f"[排程] 呼叫 /retry_poll_joytel/{trans_id} 失敗: {e}")
-
+            ok, msg = trigger_poll_ftc(tid)
+            if ok:
+                retried_ftc_poll.append(tid)
+        elif qc == "AUTO003" and code and otid:
+            ok, msg = trigger_poll_joytel(tid)
+            if ok:
+                retried_joytel_poll.append(tid)
         else:
-            # 其他供應商，或 JOYTEL 但缺 orderCode/orderTid → 只記錄，人工介入
-            logging.warning(f"[排程] 訂單 {trans_id} 卡在 processing 超過1小時，qc={qc} orderCode={orderCode} orderTid={orderTid}，需人工檢查")
-            stuck_processing.append({"trans_id": trans_id, "qc": qc, "orderCode": orderCode, "orderTid": orderTid, "note": note})
+            stuck.append({"trans_id": tid, "qc": qc, "note": note})
 
     return jsonify({
         "status": "ok",
         "retried_pending": retried_pending,
         "retried_ftc_poll": retried_ftc_poll,
         "retried_joytel_poll": retried_joytel_poll,
-        "stuck_processing_needs_manual_check": stuck_processing
+        "stuck_processing_needs_manual_check": stuck,
     })
 # 手動查一次 AUTO002(FTC) 的 esim 資訊，不啟動長輪詢、不寫資料庫，純粹看供應商目前回什麼
 @app.route("/manual_query_ftc/<trans_id>")
